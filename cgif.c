@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-
+#include <math.h>
 #include "cgif.h"
 
 #define HEADER_OFFSET_SIGNATURE    (0x00)
@@ -602,16 +602,268 @@ Done:
   return pNewImageData;
 }
 
+/* set transparency, strategy a (set all transparent that can be set transparent)*/
+static int setTransparency_a(CGIF* pGIF, CGIF_Frame* pFrame, uint8_t* pTmpImageData, const uint16_t imageWidth) {
+  uint8_t const* pBefImageData;
+  uint32_t i, x;
+  pBefImageData = pFrame->pBef->config.pImageData;
+  for(i = 0; i < pFrame->height; ++i) {
+    for(x = 0; x < pFrame->width; ++x) {
+      if(cmpPixel(pGIF, pFrame, pFrame->pBef, pTmpImageData[MULU16(i, pFrame->width) + x], pBefImageData[MULU16(pFrame->top + i, imageWidth) + (pFrame->left + x)]) == 0) {
+        pTmpImageData[MULU16(i, pFrame->width) + x] = pFrame->transIndex;
+      }
+    }
+  }
+  return 0;
+}
+
+/* set transparency, strategy b (set transparent for blocks with changing color)*/
+static int setTransparency_b(CGIF* pGIF, CGIF_Frame* pFrame, uint8_t* pTmpImageData, const uint16_t imageWidth) {
+  uint32_t startBlk; // start position of the block
+  uint8_t transpBlk; // is one currently in a transparency block?
+  uint8_t interruptBlk; // has the current block an interrupt?
+  uint8_t const* pBefImageData;
+  uint32_t i, x;
+
+  transpBlk = 0;
+  interruptBlk = 0;
+  pBefImageData = pFrame->pBef->config.pImageData;
+  for(i = 0; i < pFrame->height; ++i) {
+    for(x = 0; x < pFrame->width; ++x) {
+      if(cmpPixel(pGIF, pFrame, pFrame->pBef, pTmpImageData[MULU16(i, pFrame->width) + x], pBefImageData[MULU16(pFrame->top + i, imageWidth) + (pFrame->left + x)]) == 0) {
+        if(!transpBlk){
+          startBlk = MULU16(i, pFrame->width) + x;
+          transpBlk = 1;
+        } else if(pTmpImageData[MULU16(i, pFrame->width) + x] != pTmpImageData[MULU16(i, pFrame->width) + x -1]) {
+          interruptBlk = 1; // interrupt of block detected
+        }
+      } else {
+        if(transpBlk && interruptBlk){
+          memset(pTmpImageData + startBlk, pFrame->transIndex, MULU16(i, pFrame->width) + x - startBlk); //set block transparent
+        }
+        transpBlk = 0;
+        interruptBlk = 0;
+      }
+    }
+  }
+  return 0;
+}
+
+/* create matrix with conditioned probabilities from one pixel to the next (log-probabilities)*/
+static uint8_t create_transition_matrix(float* transition, const uint8_t* imgData, const uint16_t nMatrix, const uint32_t lenImg, const float smoothing){
+  // nMatrix x nMatrix: size of transition matrix
+  // lenImg: size of image in one dimension
+  uint16_t i,j;
+  float sum;
+  memset(transition, 0.0 + smoothing, sizeof(float) * nMatrix * nMatrix);
+  for(uint32_t k=1;k<lenImg;k++){
+    transition[imgData[k]*nMatrix + imgData[k-1]] += 1; //t_ij: transition from j to i
+  }
+  for(i=0;i<nMatrix;i++){
+    sum = 0;
+    for(j=0;j<nMatrix;j++){
+      sum += transition[i*nMatrix + j];
+    }
+    for(j=0;j<nMatrix;j++){
+      transition[i*nMatrix + j] = log(transition[i*nMatrix + j] / sum);
+    }
+  }
+  return 0;
+}
+
+static float max_argmax(float a, float b, uint8_t* argmax){
+  if(a<b){
+    *argmax = 1;
+    return b;
+  } else {
+    *argmax = 0;
+    return a;
+  }
+}
+
+/* set transparency, strategy c (maximize probability of a (reappearing) sequence by setting transparency)*/
+static int setTransparency_c(CGIF* pGIF, CGIF_Frame* pFrame, uint8_t* pTmpImageData, const uint16_t imageWidth) {
+  uint8_t const* pBefImageData;
+  uint8_t nRep = 1; // number of iterations (more iteratons gets worse?)
+  uint8_t r, argmax, transpBlk; // repetition number, argmax, is in transparency block or not
+  float initP = 0.5; // initial probability to set pixel transparent
+  float smoothing = 0.0001; // smoothing for transition probabilities
+  uint32_t x, iblk; // pixel index, block index
+  int64_t i;
+  uint8_t* pTmpImageDataSave;
+  uint32_t numBlk = 0; // number of transparency blocks
+  uint32_t b; // current block number
+  uint32_t* blkStart; // start of transparency block
+  uint32_t* blkStop; // stop of transparency block
+  float* p_sq0; // stores probability of sequence with current pixel non-transparent
+  float* p_sq1; // staroes probability of sequence with current pixel transparent
+  uint8_t* i_sq0; // index to previous transparency setting if current pixel is non-transparent (needed for Viterbi backward)
+  uint8_t* i_sq1; // index to previous transparency setting if current pixel is transparent (needed for Viterbi backward)
+  uint16_t nMatrix = 256;  //smaller would work only for global color table: (1uL << calcNextPower2Ex(pGIF->config.numGlobalPaletteEntries + 1));
+  float transition[nMatrix * nMatrix]; // matrix with conditioned probabilities (t_ij -- probability that pixel i follows j)
+  blkStart = malloc(sizeof(uint32_t) * (MULU16(pFrame->width, pFrame->height)/2 + 1)); // first pixel in transparency block, index refers directly to frame, number of blocks cannot be more than image/2
+  blkStop = malloc(sizeof(uint32_t) * (MULU16(pFrame->width, pFrame->height)/2 + 1)); // last pixel in transparency block, index refers directly to frame, number of blocks cannot be more than image/2
+  p_sq0 = malloc(sizeof(float) * MULU16(pFrame->width, pFrame->height)); // probability of sequence given current pixel is not transparent (much space allocated, usually less needed)
+  p_sq1 = malloc(sizeof(float) * MULU16(pFrame->width, pFrame->height)); // probability of sequence given current pixel is transparent 
+  i_sq0 = malloc(MULU16(pFrame->width, pFrame->height));
+  i_sq1 = malloc(MULU16(pFrame->width, pFrame->height));
+  pBefImageData = pFrame->pBef->config.pImageData;
+
+  // save the original image data with nothing set to transparent
+  pTmpImageDataSave = malloc(MULU16(pFrame->width, pFrame->height));
+  memcpy(pTmpImageDataSave, pTmpImageData, MULU16(pFrame->width, pFrame->height));
+  
+  // create transparency blocks
+  b = 0;
+  transpBlk = 0;
+  for(i = 0; i < pFrame->height; ++i) {
+    for(x = 0; x < pFrame->width; ++x) {
+      if(cmpPixel(pGIF, pFrame, pFrame->pBef, pTmpImageData[MULU16(i, pFrame->width) + x], pBefImageData[MULU16(pFrame->top + i, imageWidth) + (pFrame->left + x)]) == 0) {
+        if(transpBlk == 0){
+          blkStart[b] = MULU16(i, pFrame->width) + x;
+          transpBlk = 1;
+        }
+      } else if(transpBlk == 1){
+          transpBlk = 0;
+          blkStop[b] = MULU16(i, pFrame->width) + x -1; // block stop is last index of block
+          b++;
+      }
+    }
+  }
+  if(transpBlk == 1){ // if the last block goes to the very end
+    blkStop[b] = MULU16(i-1, pFrame->width) + x-1; //note: i,x too large by one when loops left
+    b++;
+  }
+  numBlk = b;
+
+  // set fraction randomly to transparent and create initial transition matrix (TBD: check setting whole blocks to transparent)
+  for(b=0;b<numBlk;b++){
+    for(i=blkStart[b];i<=blkStop[b];i++){
+      if((float)rand() / (float)RAND_MAX < initP){
+        pTmpImageData[i] = pFrame->transIndex;
+      }
+    }
+  }
+  
+  // optimize transparency setting
+  for(r=0;r<nRep;r++){
+    create_transition_matrix(transition, pTmpImageData, nMatrix, MULU16(pFrame->width, pFrame->height), smoothing); // create transition matrix with latest transparency setting
+    memcpy(pTmpImageData, pTmpImageDataSave, MULU16(pFrame->width, pFrame->height)); // reset image
+    for(b=0;b<numBlk;b++){ // optimization for every single block
+      // transition into transparency block
+      if(blkStart[b] == 0){
+        p_sq0[0] = -1; // set to some value (could use unconditioned probability)
+        p_sq1[0] = -1;
+      } else{
+        p_sq0[0] = transition[pTmpImageData[blkStart[b]]*nMatrix + pTmpImageData[blkStart[b]-1]];
+        p_sq1[0] = transition[pFrame->transIndex*nMatrix + pTmpImageData[blkStart[b]-1]];
+      }
+      iblk = 1;
+      for(i=blkStart[b]+1;i<=blkStop[b];i++){ // only transitions inside the block
+        p_sq0[iblk] = max_argmax(p_sq0[iblk-1] + transition[pTmpImageData[i]*nMatrix + pTmpImageData[i-1]], p_sq1[iblk-1] + transition[pTmpImageData[i]*nMatrix + pFrame->transIndex], &argmax);
+        i_sq0[iblk] = argmax;
+        p_sq1[iblk] = max_argmax(p_sq0[iblk-1] + transition[pFrame->transIndex*nMatrix + pTmpImageData[i-1]], p_sq1[iblk-1] + transition[pFrame->transIndex*nMatrix + pFrame->transIndex], &argmax);
+        i_sq1[iblk] = argmax;
+        iblk++;
+      }
+      //transition out of transparency block
+      if(blkStop[b] < MULU16(pFrame->width, pFrame->height) - 1){
+        max_argmax(p_sq0[iblk-1] + transition[pTmpImageData[i]*nMatrix + pTmpImageData[i-1]], p_sq1[iblk-1] + transition[pTmpImageData[i]*nMatrix + pFrame->transIndex], &argmax); // note that i=blkStop[b]+1 at end of loop
+      } else { // transparency block goes to the very end
+        max_argmax(p_sq0[iblk-1], p_sq1[iblk-1], &argmax);
+      }
+      //go backwards and set transparency
+      for(i=blkStop[b];i>=blkStart[b];i--){
+        iblk--;
+        if(argmax == 1){
+          pTmpImageData[i] = pFrame->transIndex;
+          argmax = i_sq1[iblk];
+        } else {
+          argmax = i_sq0[iblk];
+        }
+      }
+    }
+  }
+  free(p_sq0);
+  free(p_sq1);
+  free(i_sq0);
+  free(i_sq1);
+  free(pTmpImageDataSave);
+  free(blkStart);
+  free(blkStop);
+  return 0;
+}
+
+/* set transparency, strategy c (choose best of strategy a/b and nothing transparent at all)*/
+static int setTransparency_bestof(CGIF* pGIF, CGIF_Frame* pFrame, uint8_t* pTmpImageData, const uint16_t imageWidth) {
+  uint8_t* pRasterDataA;
+  uint8_t* pRasterDataB;
+  uint8_t* pRasterDataC;
+  uint8_t* pTmpImageDataSave;
+  uint32_t sizeRasterDataA, sizeRasterDataB, sizeRasterDataC;
+  int r;
+
+  pTmpImageDataSave = malloc(MULU16(pFrame->width, pFrame->height));
+  memcpy(pTmpImageDataSave, pTmpImageData, MULU16(pFrame->width, pFrame->height));
+
+  setTransparency_a(pGIF, pFrame, pTmpImageData, imageWidth); // set transparency
+  r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageData); //create raster data for stretegy a
+  pRasterDataA = malloc(pFrame->sizeRasterData);
+  memcpy(pRasterDataA, pFrame->pRasterData, pFrame->sizeRasterData); // save raster data
+  sizeRasterDataA = pFrame->sizeRasterData; // save the size of raster data
+  memcpy(pTmpImageData, pTmpImageDataSave, MULU16(pFrame->width, pFrame->height)); // reset pTmpImageData
+
+  setTransparency_b(pGIF, pFrame, pTmpImageData, imageWidth); // set transparency
+  r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageData); //create raster data for stretegy b
+  pRasterDataB = malloc(pFrame->sizeRasterData);
+  memcpy(pRasterDataB, pFrame->pRasterData, pFrame->sizeRasterData); // save raster data
+  sizeRasterDataB = pFrame->sizeRasterData; // save the size of raster data
+  memcpy(pTmpImageData, pTmpImageDataSave, MULU16(pFrame->width, pFrame->height)); // reset pTmpImageData
+
+  setTransparency_c(pGIF, pFrame, pTmpImageData, imageWidth); // set transparency
+  r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageData); //create raster data for stretegy c
+  pRasterDataC = malloc(pFrame->sizeRasterData);
+  memcpy(pRasterDataC, pFrame->pRasterData, pFrame->sizeRasterData); // save raster data
+  sizeRasterDataC = pFrame->sizeRasterData; // save the size of raster data
+  
+  r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageDataSave); //create raster data for nothing transparent
+
+  free(pTmpImageDataSave);
+  free(pTmpImageData);
+  if(sizeRasterDataA < pFrame->sizeRasterData && sizeRasterDataA < sizeRasterDataB && sizeRasterDataA < sizeRasterDataC) {
+    free(pRasterDataB);
+    free(pRasterDataC);
+    free(pFrame->pRasterData);
+    pFrame->sizeRasterData = sizeRasterDataA;
+    pFrame->pRasterData = pRasterDataA;
+  } else if(sizeRasterDataB < pFrame->sizeRasterData && sizeRasterDataB < sizeRasterDataC) {
+    free(pRasterDataA);
+    free(pRasterDataC);
+    free(pFrame->pRasterData);
+    pFrame->sizeRasterData = sizeRasterDataB;
+    pFrame->pRasterData = pRasterDataB;
+  } else if(sizeRasterDataC < pFrame->sizeRasterData){
+    free(pRasterDataA);
+    free(pRasterDataB);
+    free(pFrame->pRasterData);
+    pFrame->sizeRasterData = sizeRasterDataC;
+    pFrame->pRasterData = pRasterDataC;
+  } else {
+    free(pRasterDataA);
+    free(pRasterDataB);
+    free(pRasterDataC);
+  }
+  return r;
+}
+
 /* add a new GIF-frame and write it */
 int cgif_addframe(CGIF* pGIF, CGIF_FrameConfig* pConfig) {
   CGIF_Frame*   pFrame;
   uint8_t* pTmpImageData;
-  uint8_t* pBefImageData;
   uint16_t numPaletteEntries;
   uint16_t imageWidth;
   uint16_t imageHeight;
   uint8_t  initialCodeSize;
-  uint32_t i, x;
   int      isFirstFrame;
   int      useLocalTable;
   int      hasTransparency;
@@ -694,28 +946,24 @@ int cgif_addframe(CGIF* pGIF, CGIF_FrameConfig* pConfig) {
   memcpy(pFrame->aImageHeader + IMAGE_OFFSET_HEIGHT, &frameHeightLE, sizeof(uint16_t));
   memcpy(pFrame->aImageHeader + IMAGE_OFFSET_TOP,    &frameTopLE,    sizeof(uint16_t));
   memcpy(pFrame->aImageHeader + IMAGE_OFFSET_LEFT,   &frameLeftLE,   sizeof(uint16_t));
+  pFrame->pRasterData = NULL; // depending on the method raster data will be computed while setting transparency
   // mark matching areas of the previous frame as transparent, if required (CGIF_FRAME_GEN_USE_TRANSPARENCY set)
   if(pFrame->config.genFlags & CGIF_FRAME_GEN_USE_TRANSPARENCY) {
     if(pTmpImageData == NULL) {
       pTmpImageData = malloc(MULU16(imageWidth, imageHeight)); // TBD check return value of malloc
       memcpy(pTmpImageData, pConfig->pImageData, MULU16(imageWidth, imageHeight));
     }
-    pBefImageData = pFrame->pBef->config.pImageData;
-    for(i = 0; i < pFrame->height; ++i) {
-      for(x = 0; x < pFrame->width; ++x) {
-        if(cmpPixel(pGIF, pFrame, pFrame->pBef, pTmpImageData[MULU16(i, pFrame->width) + x], pBefImageData[MULU16(pFrame->top + i, imageWidth) + (pFrame->left + x)]) == 0) {
-          pTmpImageData[MULU16(i, pFrame->width) + x] = pFrame->transIndex;
-        }
-      }
-    }
+    r = setTransparency_bestof(pGIF, pFrame, pTmpImageData, imageWidth); //TBD: no error handling yet
   }
 
   // generate LZW raster data (actual image data)
-  if((pFrame->config.genFlags & CGIF_FRAME_GEN_USE_TRANSPARENCY) || (pFrame->config.genFlags & CGIF_FRAME_GEN_USE_DIFF_WINDOW)) {
-    r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageData);
-    free(pTmpImageData);
-  } else {
-    r = LZW_GenerateStream(pFrame, MULU16(imageWidth, imageHeight), pConfig->pImageData);
+  if(pFrame->pRasterData == NULL) {
+    if((pFrame->config.genFlags & CGIF_FRAME_GEN_USE_TRANSPARENCY) || (pFrame->config.genFlags & CGIF_FRAME_GEN_USE_DIFF_WINDOW)) {
+      r = LZW_GenerateStream(pFrame, MULU16(pFrame->width, pFrame->height), pTmpImageData);
+      free(pTmpImageData);
+    } else {
+      r = LZW_GenerateStream(pFrame, MULU16(imageWidth, imageHeight), pConfig->pImageData);
+    }
   }
 
   // cleanup
